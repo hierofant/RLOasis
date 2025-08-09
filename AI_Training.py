@@ -84,14 +84,17 @@ class FramePredictor(nn.Module):
 
 class VideoJoystickDataset(Dataset):
     def __init__(self, video_dir, img_size=(96, 64)):
-        self.index = []
+        # совместим обе версии, чтобы ничего не упало
+        self.index = []          # из main
+        self.samples = self.index  # алиас для старого кода
+        self.sequences = []      # из другой ветки (если где-то используется)
+
         self.transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
         ])
         self.img_size = img_size
-        self.video_dir = video_dir
-        self.fps_cache = {}
+
 
         video_files = glob(os.path.join(video_dir, "*.mp4"))
 
@@ -109,14 +112,12 @@ class VideoJoystickDataset(Dataset):
             print(f"\n[+] Анализ {base_name}")
             cap = cv2.VideoCapture(vid_path)
             input_fps = cap.get(cv2.CAP_PROP_FPS)
-            cap.release()
-
-            self.fps_cache[vid_path] = input_fps
-            total_frames = int(cv2.VideoCapture(vid_path).get(cv2.CAP_PROP_FRAME_COUNT))
-            frame_skip = int(round(input_fps / TARGET_FPS)) if input_fps > 0 else 2
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            frame_skip = int(round(input_fps / TARGET_FPS)) if input_fps > 0 else 1
             usable_frames = total_frames // frame_skip
 
             if usable_frames < PREDICT_AHEAD + 1:
+                cap.release()
                 continue
 
             joystick = pd.read_csv(csv_path)
@@ -130,41 +131,60 @@ class VideoJoystickDataset(Dataset):
             yaw_interp = np.interp(t_video, t_csv, yaw)
             acc_interp = np.interp(t_video, t_csv, acc)
 
-            for i in range(usable_frames - PREDICT_AHEAD):
-                self.index.append({
-                    "vid_path": vid_path,
-                    "yaw": yaw_interp[i],
-                    "acc": acc_interp[i],
-                    "frame_idx": i * frame_skip,
-                    "frame_skip": frame_skip
-                })
+            frames = []
+            for i in range(usable_frames):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, i * frame_skip)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame = cv2.resize(frame, self.img_size)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = self.transform(frame)
+                frames.append(frame)
+            cap.release()
 
-        print(f"\n[✓] Всего пар: {len(self.index)}")
+            self.sequences.append({"frames": frames, "yaw": yaw_interp, "acc": acc_interp})
+
+            for i in range(len(frames) - PREDICT_AHEAD):
+                f1 = frames[i]
+                f2 = frames[i + PREDICT_AHEAD]
+                js = torch.tensor([yaw_interp[i], acc_interp[i]], dtype=torch.float32)
+                self.samples.append((f1, js, f2))
+
+        print(f"\n[✓] Всего пар: {len(self.samples)}")
 
     def __len__(self):
-        return len(self.index)
+        return len(self.samples)
 
     def __getitem__(self, i):
-        record = self.index[i]
-        cap = cv2.VideoCapture(record["vid_path"])
-        f1 = self.read_frame(cap, record["frame_idx"])
-        f2 = self.read_frame(cap, record["frame_idx"] + record["frame_skip"] * PREDICT_AHEAD)
-        cap.release()
+        return self.samples[i]
 
-        f1 = self.transform(f1)
-        f2 = self.transform(f2)
-        js = torch.tensor([record["yaw"], record["acc"]], dtype=torch.float32)
-        return f1, js, f2
 
-    def read_frame(self, cap, idx):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
-            frame = np.zeros((self.img_size[1], self.img_size[0], 3), dtype=np.uint8)
-        else:
-            frame = cv2.resize(frame, self.img_size)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        return frame
+def save_epoch_video(model, dataset, epoch, seq_idx=0, max_frames=120, out_dir="generated"):
+    model.eval()
+    os.makedirs(out_dir, exist_ok=True)
+    seq = dataset.sequences[seq_idx]
+    frames = seq["frames"]
+    yaw = seq["yaw"]
+    acc = seq["acc"]
+    current = frames[0].unsqueeze(0).to(DEVICE)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out_path = os.path.join(out_dir, f"epoch_{epoch+1}.mp4")
+    writer = cv2.VideoWriter(out_path, fourcc, TARGET_FPS, IMG_SIZE)
+    steps = min(len(frames) - 1, max_frames)
+    for i in range(steps):
+        js = torch.tensor([yaw[i], acc[i]], dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        with torch.no_grad():
+            pred = model(current, js)
+        frame = pred[0].cpu()
+        img = (frame * 0.5 + 0.5).clamp(0, 1).permute(1, 2, 0).numpy()
+        img = (img * 255).astype(np.uint8)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        writer.write(img)
+        current = pred
+    writer.release()
+    model.train()
+    print(f"[✓] Сохранён пример работы модели: {out_path}")
 
 
 def train():
@@ -195,6 +215,7 @@ def train():
 
         print(f"[{epoch+1}/{EPOCHS}] Loss: {total_loss / len(loader):.6f}")
         torch.save(model.state_dict(), f"model_epoch_{epoch+1}.pth")
+        save_epoch_video(model, dataset, epoch)
 
 if __name__ == "__main__":
     print("[✓] Запуск обучения с предсказанием вперёд на", PREDICT_AHEAD, "кадров")

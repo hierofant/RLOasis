@@ -84,13 +84,17 @@ class FramePredictor(nn.Module):
 
 class VideoJoystickDataset(Dataset):
     def __init__(self, video_dir, img_size=(96, 64)):
-        self.samples = []
-        self.sequences = []
+        # совместим обе версии, чтобы ничего не упало
+        self.index = []          # из main
+        self.samples = self.index  # алиас для старого кода
+        self.sequences = []      # из другой ветки (если где-то используется)
+
         self.transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
         ])
         self.img_size = img_size
+
 
         video_files = glob(os.path.join(video_dir, "*.mp4"))
 

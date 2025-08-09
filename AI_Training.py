@@ -10,8 +10,8 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-VIDEO_DIR = "./your_dataset"
-IMG_SIZE = (256, 144)
+VIDEO_DIR = "./processed_dataset"
+IMG_SIZE = (96, 64)
 EPOCHS = 10
 BATCH_SIZE = 16
 PREDICT_AHEAD = 15
@@ -22,61 +22,60 @@ class FramePredictor(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder1 = nn.Sequential(
-            nn.Conv2d(3, 64, 4, 2, 1),  # 256x144 -> 128x72
+            nn.Conv2d(3, 64, 4, 2, 1),  # W,H → /2
             nn.ReLU()
         )
         self.encoder2 = nn.Sequential(
-            nn.Conv2d(64, 128, 4, 2, 1),  # 128x72 -> 64x36
+            nn.Conv2d(64, 128, 4, 2, 1),  # /4
             nn.ReLU()
         )
         self.encoder3 = nn.Sequential(
-            nn.Conv2d(128, 256, 4, 2, 1),  # 64x36 -> 32x18
+            nn.Conv2d(128, 256, 4, 2, 1),  # /8
             nn.ReLU(),
-            nn.Conv2d(256, 256, 4, 2, 1),  # 32x18 -> 16x9
+            nn.Conv2d(256, 256, 4, 2, 1),  # /16
             nn.ReLU()
         )
 
         self.joystick_fc = nn.Sequential(
             nn.Linear(2, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128 * 9 * 16),
             nn.ReLU()
         )
 
         self.decoder1 = nn.Sequential(
-            nn.ConvTranspose2d(384, 128, 4, 2, 1),  # 18x32 → 36x64
+            nn.ConvTranspose2d(384, 128, 4, 2, 1),
             nn.ReLU()
         )
         self.decoder2 = nn.Sequential(
-            nn.ConvTranspose2d(256, 64, 4, 2, 1),   # 36x64 → 72x128
+            nn.ConvTranspose2d(256, 64, 4, 2, 1),
             nn.ReLU()
         )
         self.decoder3 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),   # 36x64 → 72x128
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),
             nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),    # 72x128 → 144x256
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),
             nn.ReLU(),
-            nn.Conv2d(32, 3, 3, 1, 1),              # 144x256 → 144x256
+            nn.Conv2d(32, 3, 3, 1, 1),
             nn.Sigmoid()
         )
 
     def forward(self, frame_t, joystick):
-        e1 = self.encoder1(frame_t)   # → [B, 64, 72, 128]
-        e2 = self.encoder2(e1)        # → [B, 128, 36, 64]
-        e3 = self.encoder3(e2)        # → [B, 256, 9, 16]
+        B, C, H, W = frame_t.shape
+        e1 = self.encoder1(frame_t)
+        e2 = self.encoder2(e1)
+        e3 = self.encoder3(e2)
 
-        z_js = self.joystick_fc(joystick).view(-1, 128, 9, 16)
+        h16, w16 = e3.shape[2], e3.shape[3]
+        js = self.joystick_fc(joystick)
+        z_js = js.view(B, 128, 1, 1).expand(B, 128, h16, w16)
         z = torch.cat([e3, z_js], dim=1)
 
-        d1 = self.decoder1(z)  # → [B, 128, 18, 32]
+        d1 = self.decoder1(z)
+        e2_resized = torch.nn.functional.interpolate(e2, size=d1.shape[2:], mode='bilinear', align_corners=False)
+        d1 = torch.cat([d1, e2_resized], dim=1)
 
-        e2_resized = torch.nn.functional.interpolate(e2, size=(18, 32), mode='bilinear', align_corners=False)
-        d1 = torch.cat([d1, e2_resized], dim=1)  # → [B, 256, 18, 32]
-
-        d2 = self.decoder2(d1)  # → [B, 64, 36, 64]
-
-        e1_resized = torch.nn.functional.interpolate(e1, size=(36, 64), mode='bilinear', align_corners=False)
-        d2 = torch.cat([d2, e1_resized], dim=1)  # → [B, 128, 36, 64]
+        d2 = self.decoder2(d1)
+        e1_resized = torch.nn.functional.interpolate(e1, size=d2.shape[2:], mode='bilinear', align_corners=False)
+        d2 = torch.cat([d2, e1_resized], dim=1)
 
         pred_frame = self.decoder3(d2)
         return pred_frame
@@ -84,7 +83,7 @@ class FramePredictor(nn.Module):
 
 
 class VideoJoystickDataset(Dataset):
-    def __init__(self, video_dir, img_size=(256, 144)):
+    def __init__(self, video_dir, img_size=(96, 64)):
         self.index = []
         self.transform = transforms.Compose([
             transforms.ToTensor(),
